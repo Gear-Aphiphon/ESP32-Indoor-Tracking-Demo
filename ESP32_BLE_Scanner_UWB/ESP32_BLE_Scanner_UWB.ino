@@ -7,20 +7,19 @@
 #include <esp_task_wdt.h>
 #include "PubSubClient.h"
 
-#define WDT_TIMEOUT 2
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "freertos/event_groups.h"
 
-TaskHandle_t ScannerTaskHandle;
-TaskHandle_t WifiTaskHandle;
+#define WDT_TIMEOUT 2
 
-const char *ssid = "WEDO_devday_1";
+TaskHandle_t ScannerTaskHandle;
+
+const char *ssid = "IndoorTracker";
 const char *wifi_password = "developerday";
 
-const char *mqtt_server = "192.168.2.102";
+const char *mqtt_server = "192.168.161.133";
 const char *mqtt_topic = "sensor/uwb";
 const char *mqtt_username = "wedo";    // MQTT username
 const char *mqtt_password = "123456";  // MQTT password
@@ -42,12 +41,31 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     String deviceAddressString = String(deviceAddress.toString().c_str());
     String deviceManufacturingString = String(UWBtoManufacturer(advertisedDevice).c_str());
 
-    if ((advertisedDevice.getName() == "UWB DO") && (deviceManufacturingString.indexOf("444f444f") >= 0) && client.connected()) {
+    if ((advertisedDevice.getName() == "UWB DO") && (deviceManufacturingString.indexOf("444f444f") >= 0)) {
       Serial.print("Timestamp: ");
       Serial.println(xTaskGetTickCount());
       Serial.print("UWB Device: ");
       Serial.println(deviceManufacturingString);
-      Serial.println(deviceManufacturingString.c_str());
+      
+      uint8_t dataPacket[advertisedDevice.getManufacturerData().length()];
+      memset(dataPacket, 0, advertisedDevice.getManufacturerData().length());
+      memcpy(dataPacket, advertisedDevice.getManufacturerData().data(), advertisedDevice.getManufacturerData().length());
+
+      int16_t positionX = (dataPacket[6] << 8) | dataPacket[7];
+      int16_t positionY = (dataPacket[8] << 8) | dataPacket[9];
+      int16_t positionZ = (dataPacket[10] << 8) | dataPacket[11];
+
+      Serial.print("\tX = ");
+      Serial.print(positionX/100.0f);
+      Serial.println("m");
+
+      Serial.print("\tY = ");
+      Serial.print(positionY/100.0f);
+      Serial.println("m");
+
+      Serial.print("\tZ = ");
+      Serial.print(positionZ/100.0f);
+      Serial.println("m");
 
       if (WiFi.isConnected() && client.connected()) {
         client.publish(mqtt_topic, deviceManufacturingString.c_str(), deviceManufacturingString.length());
@@ -58,6 +76,15 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
   }
 };
+
+static volatile boolean isScanning = false;
+
+void scanComplete(BLEScanResults scanResults)
+{
+  Serial.print("Scan complete: ");
+  Serial.println(millis());
+  isScanning = false;
+}
 
 void ScannerTask(void *pvParameters) {
   Serial.print("Scanner running on core ");
@@ -77,51 +104,54 @@ void ScannerTask(void *pvParameters) {
   esp_task_wdt_add(NULL); //add current thread to WDT watch
 
   for (;;) {
+    if (!isScanning) {
+      isScanning = true;
+      pBLEScan->stop();
+      pBLEScan->start(1, scanComplete, false);
+    }
+    
     esp_task_wdt_reset();
-    BLEScanResults foundDevices = pBLEScan->start(1, false);
-    pBLEScan->clearResults();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    client.loop();
   }
 }
 
-void ConnectWifi() {
-  static unsigned long t = 0;
+void WiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println("Successfully connected to Access Point");
+}
+
+void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println("WIFI is connected!");
+  Serial.println("IP anchorAddress: ");
+  Serial.println(WiFi.localIP());
+}
+
+void WiFiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println("Disconnected from WIFI access point");
+  Serial.print("WiFi lost connection. Reason: ");
+  Serial.println(info.wifi_sta_disconnected.reason);
+  Serial.println("Reconnecting...");
   WiFi.begin(ssid, wifi_password);
-  for (uint i = 0; i < 50; i++) {
-    Serial.print(".");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println();
-      Serial.print("IP Address (AP): ");
-      Serial.println(WiFi.localIP());
-      return;
-    }
-  }
+}
+
+void ConnectWifi() {
+  WiFi.onEvent(WiFiConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(WiFiDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.begin(ssid, wifi_password);
+  while (WiFi.waitForConnectResult() != WL_CONNECTED);
 }
 
 
 void ConnectMQTT() {
   int random_clientID = random(1000000);
   snprintf(clientID, sizeof(clientID), "%06d", random_clientID);
-  if (!client.connected()) {
+  while (!client.connected()) {
     if (client.connect(clientID, mqtt_username, mqtt_password)) {
       Serial.println("Connected to MQTT Broker!");
     } else {
       Serial.println("Connection to MQTT Broker failed...");
     }
-  }
-}
-
-
-void WifiTask(void *pvParameters) {
-  Serial.print("Wifi running on core ");
-  Serial.println(xPortGetCoreID());
-
-  for (;;) {
-    if (!(WiFi.isConnected() && client.connected())) {
-      ESP.restart();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -131,23 +161,13 @@ void setup() {
   ConnectWifi();
   ConnectMQTT();
 
-  xTaskCreatePinnedToCore(
-    WifiTask,        /* Task function. */
-    "WIFI",          /* name of task. */
-    0x2000,          /* Stack size of task */
-    NULL,            /* parameter of the task */
-    1,               /* priority of the task */
-    &WifiTaskHandle, /* Task handle to keep track of created task */
-    0);              /* pin task to core 0 */
-
-  xTaskCreatePinnedToCore(
+  xTaskCreate(
     ScannerTask,        /* Task function. */
-    "SENS",             /* name of task. */
+    "SCAN",             /* name of task. */
     0x2000,             /* Stack size of task */
     NULL,               /* parameter of the task */
     1,                  /* priority of the task */
-    &ScannerTaskHandle, /* Task handle to keep track of created task */
-    1);                 /* pin task to core 0 */
+    &ScannerTaskHandle);
 }
 
 
